@@ -1,0 +1,488 @@
+import os, math, random, warnings
+warnings.filterwarnings('ignore')
+import numpy as np, pandas as pd
+np.random.seed(42)
+random.seed(42)
+
+# Colab detection/upload
+try:
+    from google.colab import files
+    IN_COLAB = True
+except Exception:
+    IN_COLAB = False
+
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.preprocessing import StandardScaler, OneHotEncoder, LabelEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix, balanced_accuracy_score
+from sklearn.linear_model import LogisticRegression
+from sklearn.naive_bayes import GaussianNB
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.neural_network import MLPClassifier
+from sklearn.metrics import mutual_info_score
+import scipy.stats as st
+
+# ---------- CONFIG ----------
+RANDOM_STATE = 42
+SENSITIVE_RAW_COL = 'race'            # raw race column in dataset
+SENSITIVE_ATTR = 'normalized_race'    # we create this and use it for analysis
+TARGET_CANDIDATES = ['income','class','salary','target']
+TEST_SIZE = 0.30
+OUTDIR = '/content/biasmirror_outputs' if IN_COLAB else 'biasmirror_outputs'
+os.makedirs(OUTDIR, exist_ok=True)
+BOOTSTRAP_B = 500
+PERMUTATION_K = 500
+MIN_GROUP_SIZE_FOR_STATS = 30
+
+BASE_MODELS = {
+    'Logistic': LogisticRegression(max_iter=1000, random_state=RANDOM_STATE),
+    'DecisionTree': DecisionTreeClassifier(random_state=RANDOM_STATE, max_depth=6),
+    'RandomForest': RandomForestClassifier(n_estimators=200, random_state=RANDOM_STATE),
+    'KNN': KNeighborsClassifier(n_neighbors=7),
+    'NaiveBayes': GaussianNB(),
+    'MLP': MLPClassifier(hidden_layer_sizes=(50,), max_iter=500, random_state=RANDOM_STATE)
+}
+
+# ---------- HELPERS ----------
+def upload_and_get_path():
+    if IN_COLAB:
+        print("Upload your CSV now (one file).")
+        uploaded = files.upload()
+        if len(uploaded) != 1:
+            raise RuntimeError("Upload exactly one CSV file (adult dataset).")
+        path = list(uploaded.keys())[0]
+        return path
+    else:
+        # fallback local
+        for c in ['adult_income.csv','/mnt/data/adult_income.csv','/content/adult_income.csv','adult.csv']:
+            if os.path.exists(c):
+                return c
+        raise FileNotFoundError("Dataset not found locally.")
+
+def detect_and_load(path):
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        df = pd.read_csv(path, header=None)
+    df = df.loc[:, df.columns.notna()]
+    target = None
+    for c in TARGET_CANDIDATES:
+        if c in df.columns:
+            target = c
+            break
+    if target is None:
+        cols = [str(c).lower().strip() for c in df.columns]
+        for c in TARGET_CANDIDATES:
+            if c.lower() in cols:
+                target = df.columns[cols.index(c.lower())]
+                break
+    if target is None:
+        for c in df.columns:
+            vals = df[c].astype(str).unique()[:20]
+            joined = ' '.join(vals)
+            if '>50K' in joined or '<=50K' in joined:
+                target = c
+                break
+    if target is None:
+        raise ValueError("Couldn't detect target column. Ensure CSV has income/class column.")
+    return df, target
+
+# normalize/merge race
+def normalize_race(x):
+    if not isinstance(x, str): return 'Other'
+    xl = x.strip().lower()
+    # merge Asian variants
+    if 'asian' in xl or 'pac' in xl or 'islander' in xl:
+        return 'Asian'
+    if 'white' in xl:
+        return 'White'
+    if 'black' in xl:
+        return 'Black'
+    if 'native' in xl or 'amer-indian' in xl or 'indian' in xl:
+        return 'Native'
+    if 'other' in xl:
+        return 'Other'
+    return x.strip().title()
+
+def clean_and_prepare(df, target_col):
+    df = df.copy()
+    # normalize strings & missing tokens
+    for c in df.select_dtypes(include='object').columns:
+        df[c] = df[c].astype(str).str.strip()
+    df.replace('?', np.nan, inplace=True)
+    # unify target (binary 0/1)
+    df[target_col] = df[target_col].astype(str).str.strip().replace({'>50K.':'>50K','<=50K.':'<=50K'})
+    df[target_col] = df[target_col].apply(lambda v: 1 if '>50K' in str(v) else 0).astype(int)
+    # normalized race
+    if SENSITIVE_RAW_COL not in df.columns:
+        raise ValueError(f"Dataset missing raw race column '{SENSITIVE_RAW_COL}'")
+    df[SENSITIVE_ATTR] = df[SENSITIVE_RAW_COL].apply(normalize_race)
+    return df
+
+def safe_onehot_encoder():
+    try:
+        return OneHotEncoder(handle_unknown='ignore', sparse=False)
+    except TypeError:
+        try:
+            return OneHotEncoder(handle_unknown='ignore', sparse_output=False)
+        except Exception:
+            return OneHotEncoder(handle_unknown='ignore')
+
+def preprocess_features(df, target_col, sensitive_attr):
+    numeric_candidates = ['age','fnlwgt','education-num','capital-gain','capital-loss','hours-per-week']
+    numeric_features = [c for c in numeric_candidates if c in df.columns]
+    categorical_features = [c for c in df.columns if c not in numeric_features + [target_col, sensitive_attr]]
+    numeric_transformer = Pipeline([('imputer', SimpleImputer(strategy='median')), ('scaler', StandardScaler())])
+    ohe = safe_onehot_encoder()
+    categorical_transformer = Pipeline([('imputer', SimpleImputer(strategy='most_frequent')), ('ohe', ohe)])
+    preprocessor = ColumnTransformer(transformers=[
+        ('num', numeric_transformer, numeric_features),
+        ('cat', categorical_transformer, categorical_features)
+    ], remainder='drop')
+    X_raw = df.drop(columns=[target_col, sensitive_attr])
+    y = df[target_col].astype(int)
+    S = df[sensitive_attr].astype(str)
+    X_proc = preprocessor.fit_transform(X_raw)
+    # feature names
+    feature_names = []
+    feature_names.extend(numeric_features)
+    if len(categorical_features) > 0:
+        try:
+            cat_ohe = preprocessor.named_transformers_['cat']['ohe']
+            cat_cols = cat_ohe.get_feature_names_out(categorical_features).tolist()
+        except Exception:
+            cat_cols = [f"cat_{i}" for i in range(X_proc.shape[1] - len(numeric_features))]
+        feature_names.extend(cat_cols)
+    X_df = pd.DataFrame(X_proc, columns=feature_names, index=X_raw.index)
+    return X_df, y, S, preprocessor
+
+# safe confusion matrix unpack
+def safe_confusion_unravel(y_true, y_pred):
+    try:
+        cm = confusion_matrix(y_true, y_pred, labels=[0,1])
+    except Exception:
+        cm = confusion_matrix(y_true, y_pred)
+    if cm.size == 4:
+        tn, fp, fn, tp = cm.ravel()
+    else:
+        tn = fp = fn = tp = 0
+        if cm.shape == (1,1):
+            val = int(cm[0,0])
+            if set(np.unique(y_true)) == {0}:
+                tn = val
+            else:
+                tp = val
+        elif cm.shape == (1,2):
+            tn, fp = int(cm[0,0]), int(cm[0,1])
+        elif cm.shape == (2,1):
+            tn, fn = int(cm[0,0]), int(cm[1,0])
+    return tn, fp, fn, tp
+
+def group_rates(y_true, preds, sensitive):
+    groups = np.unique(sensitive)
+    results = {}
+    for g in groups:
+        idx = np.array(sensitive) == g
+        if idx.sum() == 0:
+            results[g] = {'n':0,'accuracy':np.nan,'TPR':np.nan,'FPR':np.nan,'PPV':np.nan}
+            continue
+        y_g = np.array(y_true)[idx]
+        p_g = np.array(preds)[idx]
+        tn, fp, fn, tp = safe_confusion_unravel(y_g, p_g)
+        denom = (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 1
+        acc = (tp + tn) / denom
+        tpr = tp / (tp + fn) if (tp + fn) > 0 else np.nan
+        fpr = fp / (fp + tn) if (fp + tn) > 0 else np.nan
+        ppv = tp / (tp + fp) if (tp + fp) > 0 else np.nan
+        results[g] = {'n': int(idx.sum()), 'accuracy': float(acc), 'TPR': float(tpr) if not math.isnan(tpr) else np.nan, 'FPR': float(fpr) if not math.isnan(fpr) else np.nan, 'PPV': float(ppv) if not math.isnan(ppv) else np.nan}
+    return results
+
+# --------- FIXED SPD/DI (binary one-vs-rest, correctly signed) ----------
+def statistical_parity_binary(preds, sensitive_binary):
+    """
+    preds: 0/1 labels
+    sensitive_binary: 0/1 where 1 indicates group-of-interest
+    return: P(pred=1 | group=1) - P(pred=1 | group=0)  (positive => group favored)
+    """
+    preds = np.array(preds).astype(int)
+    s = np.array(sensitive_binary).astype(int)
+    mask_g = s == 1
+    mask_r = s == 0
+    if mask_g.sum() == 0 or mask_r.sum() == 0:
+        return float('nan')
+    p_g = preds[mask_g].mean()
+    p_r = preds[mask_r].mean()
+    return float(p_g - p_r)
+
+def disparate_impact_binary(preds, sensitive_binary):
+    preds = np.array(preds).astype(int)
+    s = np.array(sensitive_binary).astype(int)
+    mask_g = s == 1
+    mask_r = s == 0
+    if mask_g.sum() == 0 or mask_r.sum() == 0:
+        return float('nan')
+    p_g = preds[mask_g].mean()
+    p_r = preds[mask_r].mean()
+    return float(p_g / (p_r + 1e-12))
+
+def mutual_info_leakage(probs, sensitive, n_bins=10):
+    if len(probs) == 0:
+        return float('nan')
+    bins = np.linspace(0,1,n_bins+1)
+    bin_ids = np.digitize(probs, bins) - 1
+    le = LabelEncoder()
+    s_enc = le.fit_transform(sensitive)
+    mi = mutual_info_score(s_enc, bin_ids)
+    return float(mi)
+
+def bootstrap_ci(function, preds, sensitive, B=BOOTSTRAP_B, seed=RANDOM_STATE):
+    rng = np.random.RandomState(seed)
+    n = len(preds)
+    stats = []
+    for _ in range(B):
+        idx = rng.choice(n, n, replace=True)
+        val = function(np.array(preds)[idx], np.array(sensitive)[idx])
+        if isinstance(val, dict):
+            vec = np.array([val[k] for k in sorted(val.keys())])
+            stats.append(np.max(np.abs(vec - vec.mean())))
+        else:
+            stats.append(float(val) if not math.isnan(val) else 0.0)
+    arr = np.array(stats, dtype=float)
+    lower = np.percentile(arr, 2.5)
+    upper = np.percentile(arr, 97.5)
+    return float(lower), float(upper)
+
+def permutation_test_spd(preds, sensitive, K=PERMUTATION_K, seed=RANDOM_STATE):
+    rng = np.random.RandomState(seed)
+    obs = statistical_parity_binary(preds, sensitive)
+    if math.isnan(obs):
+        return float('nan'), float('nan')
+    count = 0
+    s_arr = np.array(sensitive)
+    obs_abs = abs(obs)
+    for _ in range(K):
+        perm_s = rng.permutation(s_arr)
+        val = statistical_parity_binary(preds, perm_s)
+        if math.isnan(val): continue
+        if abs(val) >= obs_abs:
+            count += 1
+    pval = (count + 1) / (K + 1)
+    return float(obs), float(pval)
+
+def chi2_or_fisher(preds, sensitive):
+    groups = np.unique(sensitive)
+    if len(groups) != 2:
+        table = []
+        for g in groups:
+            table.append([int(((np.array(sensitive)==g) & (preds==0)).sum()),
+                          int(((np.array(sensitive)==g) & (preds==1)).sum())])
+        try:
+            chi2, p, dof, ex = st.chi2_contingency(table)
+            return ('chi2', float(chi2), float(p))
+        except Exception:
+            return ('chi2_err', None, float('nan'))
+    else:
+        g0, g1 = groups[0], groups[1]
+        a = int(((np.array(sensitive)==g0) & (preds==1)).sum())
+        b = int(((np.array(sensitive)==g0) & (preds==0)).sum())
+        c = int(((np.array(sensitive)==g1) & (preds==1)).sum())
+        d = int(((np.array(sensitive)==g1) & (preds==0)).sum())
+        table = np.array([[a,b],[c,d]])
+        try:
+            if table.min() < 5:
+                _, p = st.fisher_exact(table)
+                return ('fisher', None, float(p))
+            else:
+                chi2, p, dof, ex = st.chi2_contingency(table)
+                return ('chi2', float(chi2), float(p))
+        except Exception:
+            return ('chi_error', None, float('nan'))
+
+# multiclass meta-probe
+def build_meta_probe_multiclass(probs_df, sensitive, cv=5):
+    X = np.array(probs_df)
+    le = LabelEncoder()
+    y_meta = le.fit_transform(sensitive)
+    meta = LogisticRegression(max_iter=1000, random_state=RANDOM_STATE, multi_class='multinomial', solver='lbfgs')
+    skf = StratifiedKFold(n_splits=cv, shuffle=True, random_state=RANDOM_STATE)
+    try:
+        scores = cross_val_score(meta, X, y_meta, cv=skf, scoring='balanced_accuracy', error_score='raise')
+        mean_score = float(np.mean(scores)); std_score = float(np.std(scores))
+    except Exception:
+        scores = cross_val_score(meta, X, y_meta, cv=skf, scoring='accuracy', error_score='raise')
+        mean_score = float(np.mean(scores)); std_score = float(np.std(scores))
+    try:
+        meta.fit(X, y_meta)
+        y_prob = meta.predict_proba(X)
+        try:
+            macro_auc = float(roc_auc_score(y_meta, y_prob, multi_class='ovr'))
+        except Exception:
+            macro_auc = float('nan')
+    except Exception:
+        meta = None; mean_score = float('nan'); std_score = float('nan'); macro_auc = float('nan')
+    return meta, le, mean_score, std_score, macro_auc
+
+# ---------- MAIN ----------
+def main():
+    path = upload_and_get_path()
+    df, target = detect_and_load(path)
+    df = clean_and_prepare(df, target)
+    print(f"Loaded dataset shape: {df.shape}. Target detected: {target}")
+    print("Race distribution (after normalization):")
+    df[SENSITIVE_ATTR] = df[SENSITIVE_ATTR].astype(str)
+    print(df[SENSITIVE_ATTR].value_counts())
+
+    # Preprocess features and split
+    X, y, S, preproc = preprocess_features(df, target, sensitive_attr=SENSITIVE_ATTR)
+    X_train, X_test, y_train, y_test, s_train, s_test = train_test_split(X, y, S, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y)
+    print("Train/test sizes:", X_train.shape[0], X_test.shape[0])
+
+    # Train base models
+    preds = {}; probs = {}; perf = {}
+    for name, model in BASE_MODELS.items():
+        print("Training:", name)
+        try:
+            model.fit(X_train, y_train)
+        except Exception as e:
+            print(f"  Failed to fit {name}: {e}")
+            continue
+        try:
+            y_pred = model.predict(X_test)
+        except Exception:
+            y_pred = np.zeros(len(y_test), dtype=int)
+        # probabilities if available
+        y_prob = np.zeros(len(y_test))
+        try:
+            if hasattr(model, "predict_proba"):
+                prob_matrix = model.predict_proba(X_test)
+                if prob_matrix.shape[1] == 2:
+                    y_prob = prob_matrix[:,1]
+                else:
+                    y_prob = prob_matrix.max(axis=1)
+            elif hasattr(model, "decision_function"):
+                scores = model.decision_function(X_test)
+                y_prob = (scores - scores.min()) / (scores.max() - scores.min() + 1e-12)
+            else:
+                y_prob = np.array(y_pred, dtype=float)
+        except Exception:
+            y_prob = np.array(y_pred, dtype=float)
+        preds[name] = np.array(y_pred, dtype=int)
+        probs[name] = np.array(y_prob, dtype=float)
+        try:
+            auc = roc_auc_score(y_test, y_prob) if len(np.unique(y_test))>1 else float('nan')
+        except Exception:
+            auc = float('nan')
+        perf[name] = {
+            'accuracy': float(accuracy_score(y_test, y_pred)),
+            'precision': float(precision_score(y_test, y_pred, zero_division=0)),
+            'recall': float(recall_score(y_test, y_pred, zero_division=0)),
+            'f1': float(f1_score(y_test, y_pred, zero_division=0)),
+            'auc': auc
+        }
+
+    # One-vs-rest fairness evaluation (per model per group) - FIXED logic
+    groups = sorted(list(df[SENSITIVE_ATTR].unique()))
+    master_rows = []
+    printable_summary = []
+
+    for model_name in preds.keys():
+        spd_abs_list = []
+        for g in groups:
+            # binary mask for one-vs-rest (1 for this group)
+            s_binary_test = (np.array(s_test) == g).astype(int)
+            y_pred = preds[model_name]
+            y_prob = probs[model_name]
+            # compute SPD/DI using binary-safe functions (correct sign)
+            spd = statistical_parity_binary(y_pred, s_binary_test)
+            di = disparate_impact_binary(y_pred, s_binary_test)
+            # compute group rates using original string-labeled s_test
+            g_rates_by_label = group_rates(y_test, y_pred, s_test)
+            g_rates_for_g = g_rates_by_label.get(g, {'n':0,'TPR':np.nan,'FPR':np.nan,'PPV':np.nan})
+            n_group = int(g_rates_for_g['n'])
+            tpr = g_rates_for_g['TPR']
+            fpr = g_rates_for_g['FPR']
+            ppv = g_rates_for_g['PPV']
+            # significance tests guarded
+            spd_ci_lower = spd_ci_upper = float('nan')
+            spd_perm_p = float('nan')
+            if n_group >= MIN_GROUP_SIZE_FOR_STATS:
+                try:
+                    spd_ci_lower, spd_ci_upper = bootstrap_ci(lambda p,s: statistical_parity_binary(p,s), y_pred, s_binary_test, B=BOOTSTRAP_B)
+                except Exception:
+                    spd_ci_lower = spd_ci_upper = float('nan')
+                try:
+                    _, spd_perm_p = permutation_test_spd(y_pred, s_binary_test, K=PERMUTATION_K)
+                except Exception:
+                    spd_perm_p = float('nan')
+            mi = mutual_info_leakage(y_prob, s_binary_test, n_bins=10) if n_group>0 else float('nan')
+            master_rows.append({
+                'model': model_name, 'group': g, 'SPD': spd, 'DI': di,
+                'TPR': tpr, 'FPR': fpr, 'PPV': ppv, 'n_group': n_group,
+                'spd_ci_lower': spd_ci_lower, 'spd_ci_upper': spd_ci_upper, 'spd_perm_p': spd_perm_p, 'mi': mi
+            })
+            if not math.isnan(spd):
+                spd_abs_list.append(abs(spd))
+        fairness_score = float(np.mean(spd_abs_list)) if len(spd_abs_list)>0 else float('nan')
+        perf_row = perf.get(model_name, {})
+        printable_summary.append({
+            'model': model_name,
+            'accuracy': perf_row.get('accuracy', float('nan')),
+            'macro_f1': perf_row.get('f1', float('nan')),
+            'fairness_score': fairness_score
+        })
+
+    master_df = pd.DataFrame(master_rows)
+    master_csv = os.path.join(OUTDIR, 'biasmirror_master_table_fixed.csv')
+    master_df.to_csv(master_csv, index=False)
+
+    # Human-readable summary print
+    print("\n\n==== Fairness breakdown ====\n")
+    for model_name in preds.keys():
+        print(f"=== {model_name} ===")
+        md = master_df[master_df['model']==model_name].copy().sort_values(by='n_group', ascending=False)
+        for _, r in md.iterrows():
+            spd = r['SPD']; di = r['DI']; tpr = r['TPR']; fpr = r['FPR']; ngrp = int(r['n_group'])
+            spd_str = f"{spd:+.3f}" if not math.isnan(spd) else "NA"
+            di_str = f"{di:.3f}" if not math.isnan(di) else "NA"
+            tpr_str = f"{tpr:.3f}" if not math.isnan(tpr) else "NA"
+            fpr_str = f"{fpr:.3f}" if not math.isnan(fpr) else "NA"
+            print(f"  {r['group']:<10} | n={ngrp:5d} | SPD={spd_str:>7} | DI={di_str:>6} | TPR={tpr_str:>6} | FPR={fpr_str:>6}")
+        fs = [s for s in printable_summary if s['model']==model_name][0]['fairness_score']
+        print(f"  -> fairness score (mean |SPD| across groups) = {fs:.4f}\n")
+
+    # Final ranking
+    rank_df = pd.DataFrame(printable_summary).sort_values(by='fairness_score')
+    print("\n==== Final model ranking (lower fairness_score = fairer) ====\n")
+    print(rank_df.to_string(index=False, float_format='%.4f'))
+
+    # Meta-probe
+    print("\n==== Meta-probe: multiclass logistic regression on vector of model probabilities ====")
+    probs_df = pd.DataFrame(probs)
+    probs_csv = os.path.join(OUTDIR, 'model_probs_test_fixed.csv')
+    probs_df.to_csv(probs_csv, index=False)
+    try:
+        meta, le_meta, mean_score, std_score, macro_auc = build_meta_probe_multiclass(probs_df, s_test, cv=5)
+        print(f"Meta-probe balanced-accuracy (CV mean ± std): {mean_score:.4f} ± {std_score:.4f}")
+        print(f"Meta-probe macro-AUC (ovr on fitted data): {macro_auc if not math.isnan(macro_auc) else 'NA'}")
+        print(f"Label classes detected by meta-probe: {list(le_meta.classes_)}")
+        leak_strength = "weak"
+        if mean_score >= 0.7: leak_strength = "strong"
+        elif mean_score >= 0.55: leak_strength = "moderate"
+        print(f"Interpretation: demographic signal leakage from model outputs is {leak_strength}.")
+        with open(os.path.join(OUTDIR,'meta_probe_summary_fixed.txt'),'w') as f:
+            f.write(f"balanced_accuracy_cv_mean: {mean_score}\n")
+            f.write(f"balanced_accuracy_cv_std: {std_score}\n")
+            f.write(f"macro_auc: {macro_auc}\n")
+            f.write(f"classes: {list(le_meta.classes_)}\n")
+    except Exception as e:
+        print("Meta-probe failed:", e)
+
+    print("\nMaster CSV saved to:", master_csv)
+    print("All outputs directory:", OUTDIR)
+
+if __name__ == '__main__':
+    main()
