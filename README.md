@@ -1,101 +1,104 @@
-# BiasMirror: Fairness Analysis in Machine Learning Models  
+# BiasMirror — Algorithmic Fairness Auditing Tool
 
-BiasMirror is a Python-based framework for **auditing algorithmic bias** in machine learning models.  
-It evaluates fairness across demographic groups using multiple classifiers and advanced statistical metrics —  
-helping researchers and developers understand **how fair their models really are.**
+A Python tool that trains multiple classifiers on the UCI Adult Income dataset and audits each one for demographic bias across racial groups, producing a ranked fairness report with statistical significance testing.
 
 ---
 
-## Overview  
+## What It Does
 
-This project investigates algorithmic bias in ML models trained on the **UCI Adult Income dataset**.  
-It compares how different models perform with respect to both **accuracy** and **fairness**,  
-providing a complete evaluation pipeline — from preprocessing to statistical validation and fairness reporting.
+BiasMirror runs a full fairness audit pipeline:
 
----
-
-## Features  
-
-- Automated preprocessing and normalization  
-- Multi-model training and evaluation (6 classifiers)  
-- Fairness metrics: *SPD*, *DI*, *TPR*, *FPR*  
-- Bootstrapped confidence intervals + permutation significance tests  
-- Meta-probe analysis for demographic signal leakage  
-- Automatic CSV and PDF report generation  
+1. Loads and preprocesses the Adult Income dataset (auto-detects target column, handles missing values, encodes categoricals)
+2. Trains 6 classifiers on the income prediction task
+3. Computes per-group fairness metrics for each model using one-vs-rest decomposition
+4. Runs bootstrap confidence intervals and permutation significance tests on bias scores
+5. Runs a multiclass meta-probe to measure demographic signal leakage across model outputs
+6. Exports a master CSV and ranked fairness summary
 
 ---
 
-## Models Evaluated  
+## Models
 
-- Logistic Regression  
-- Decision Tree  
-- Random Forest  
-- K-Nearest Neighbors (KNN)  
-- Naive Bayes  
-- Multi-Layer Perceptron (MLP)
-
----
-
-## Dataset  
-
-- **Source:** [Adult Income Dataset](https://www.kaggle.com/datasets/wenruliu/adult-income-dataset) 
-- **Size:** 48,842 records, 16 features  
-- **Target Variable:** `income` (≤50K or >50K)  
-- **Sensitive Attribute:** `race` (normalized to White, Black, Asian, Native, Other)  
+| Model | Config |
+|---|---|
+| Logistic Regression | `max_iter=1000` |
+| Decision Tree | `max_depth=6` |
+| Random Forest | `n_estimators=200` |
+| K-Nearest Neighbors | `k=7` |
+| Naive Bayes | Gaussian |
+| MLP | `hidden_layers=(50,), max_iter=500` |
 
 ---
 
-## Methodology  
+## Fairness Metrics
 
-1. **Preprocessing**  
-   - Handle missing values and normalize numeric features  
-   - Encode categorical features  
-   - Split dataset into train/test (70–30)
+For each model × demographic group (one-vs-rest):
 
-2. **Model Training**  
-   - Train all six classifiers using identical settings  
-   - Evaluate accuracy, F1-score, and AUC  
+| Metric | Description |
+|---|---|
+| **SPD** (Statistical Parity Difference) | P(ŷ=1 \| group) − P(ŷ=1 \| rest) |
+| **DI** (Disparate Impact) | P(ŷ=1 \| group) / P(ŷ=1 \| rest) |
+| **TPR gap** | True positive rate per group |
+| **FPR gap** | False positive rate per group |
+| **PPV gap** | Precision per group |
+| **MI leakage** | Mutual information between model scores and group membership |
+| **Bootstrap CI** | 95% confidence interval on SPD (500 resamples) |
+| **Permutation p-value** | Significance of observed SPD (500 permutations) |
 
-3. **Fairness Computation**  
-   - Compute *Statistical Parity Difference (SPD)*, *Disparate Impact (DI)*, *TPR/FPR* per race group  
+Models are ranked by mean |SPD| across groups — lower = fairer.
 
-4. **Fairness Scoring**  
-   - Average |SPD| across groups = fairness score  
+### Meta-Probe
 
-5. **Meta-Probe Leakage Test**  
-   - Train a logistic regression model on each classifier’s probability outputs  
-   - Check if race can be predicted from model outputs (if yes → demographic leakage detected)
-
-6. **Reporting**  
-   - Consolidate all metrics into master CSVs and detailed PDFs  
+A multiclass logistic regression is trained on the stacked probability outputs of all 6 models to predict group membership, evaluated with 5-fold cross-validated balanced accuracy. This measures how much demographic signal leaks through model outputs even when the sensitive attribute is excluded from training.
 
 ---
 
-## Results Summary  
+## Getting Started
 
-| Model | Accuracy | Macro F1 | Fairness Score |
-|:------|:---------:|:--------:|:--------------:|
-| Decision Tree | 0.8509 | 0.6165 | **0.0646** |
-| KNN | 0.8361 | 0.6378 | 0.1013 |
-| Random Forest | 0.8534 | 0.6685 | 0.1018 |
-| MLP | 0.8493 | 0.6656 | 0.1044 |
-| Logistic Regression | 0.8542 | 0.6611 | 0.1098 |
-| Naive Bayes | 0.6017 | 0.5271 | 0.3153 |
+```bash
+pip install scikit-learn statsmodels seaborn
+```
 
-> **Decision Tree** performed as the fairest model overall, balancing predictive accuracy and fairness.  
-> **Naive Bayes** showed the highest demographic disparity.
+**In Colab (recommended):**
+
+1. Paste the notebook cell and run
+2. Upload `adult_income.csv` when prompted
+3. Outputs are written to `/content/biasmirror_outputs/`
+
+**Locally:**
+
+Place `adult_income.csv` in the working directory and run:
+
+```bash
+python biasmirror.py
+```
+
+To audit by sex instead of race, change one line in the config:
+
+```python
+SENSITIVE_ATTR = 'sex'   # default is 'race'
+```
 
 ---
 
-## Interpretation  
+## Output Files
 
-- Fairness does **not** directly correlate with accuracy — some of the most accurate models (e.g., Random Forest) still showed measurable bias.  
-- The meta-probe test revealed weak demographic signal leakage (`balanced accuracy = 0.20`, `AUC = 0.707`),  
-  indicating limited encoding of racial information in model outputs.  
-- Models differ in *who* they perform best for, even if the overall accuracy seems fair.  
+```
+biasmirror_outputs/
+├── biasmirror_master_table.csv    # per-model per-group fairness metrics
+├── model_probs_test.csv           # stacked model probability outputs
+└── meta_probe_summary.txt         # meta-probe CV scores and interpretation
+```
 
 ---
 
-## 💾 Outputs  
+## Dataset
 
-All generated files are saved in:
+UCI Adult Income (`adult_income.csv`) — predicts whether income exceeds $50K/year based on census features. Available at [archive.ics.uci.edu](https://archive.ics.uci.edu/ml/datasets/adult).
+
+---
+
+## Authors
+
+Deishaun Colins Martin (23PT05) · Devanand K (23PT06)  
+PSG College of Technology
